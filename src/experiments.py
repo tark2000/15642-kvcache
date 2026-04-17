@@ -107,7 +107,26 @@ class PythonLRUCache:
     def unpin(self, obj_id: int):
         if obj_id in self.pinned_objs:
             self.pinned_objs.remove(obj_id)
-
+            
+def process_trace_with_lcs_cache(cache, reader: MobaTraceReader):
+    """Process trace using libcachesim cache with BSA-granularity requests."""
+    import libcachesim as lcs
+    hits = 0
+    total = 0
+    for obj_id, obj_size, score in reader.generate_requests_with_scores():
+        req = lcs.Request(obj_size=obj_size, obj_id=obj_id)
+        hit = cache.find(req, update_cache=True)
+        if hit is None:
+            # miss
+            if cache.need_eviction(req):
+                cache.evict(req)
+            if cache.can_insert(req):
+                cache.insert(req)
+        else:
+            hits += 1
+        total += 1
+    miss_ratio = 1.0 - (hits / total if total > 0 else 0.0)
+    return miss_ratio, miss_ratio
 
 def run_algorithm_comparison(config_path: str, algorithms: List[str], cache_sizes: List[float], out_path: str, max_traces: int = 0):
     config = sim_config()
@@ -173,12 +192,23 @@ def run_algorithm_comparison(config_path: str, algorithms: List[str], cache_size
                         if alg.lower() == 'momentum_decay':
                             cache = setup_cache(config)
                             req_miss_ratio, _ = process_trace_with_momentum(cache, reader)
+                        elif alg.lower() == 'proactive_eviction':
+                            from proactive_eviction import ProactiveEvictionCache
+                            from simulator import process_trace_with_proactive
+                            cache = setup_cache(config)
+                            req_miss_ratio, _ = process_trace_with_proactive(cache, reader)
+                        elif alg.lower() == 'belady':
+                            from belady_cache import BeladyCache
+                            from simulator import process_trace_with_belady
+                            cache = BeladyCache(int(config.cache_size * 1024 * 1024 * 1024))
+                            req_miss_ratio, _ = process_trace_with_belady(cache, reader)
                         elif alg.lower() == 'python_lru':
                             cache = PythonLRUCache(int(config.cache_size * 1024 * 1024 * 1024))
                             req_miss_ratio, _ = cache.process_trace(reader)
                         else:
                             cache = setup_cache(config)
-                            req_miss_ratio, _ = cache.process_trace(reader)
+                            req_miss_ratio, _ = process_trace_with_lcs_cache(cache, reader)
+
                         req_hit_rate = 1.0 - req_miss_ratio
                         total_req_hit_rate += req_hit_rate
                         # cleanup tmp
@@ -192,13 +222,24 @@ def run_algorithm_comparison(config_path: str, algorithms: List[str], cache_size
                 if alg.lower() == 'momentum_decay':
                     cache = setup_cache(config)
                     req_miss_ratio, _ = process_trace_with_momentum(cache, reader)
+                elif alg.lower() == 'proactive_eviction':
+                    from proactive_eviction import ProactiveEvictionCache
+                    from simulator import process_trace_with_proactive
+                    cache = setup_cache(config)
+                    req_miss_ratio, _ = process_trace_with_proactive(cache, reader)
+                elif alg.lower() == 'belady':
+                    from belady_cache import BeladyCache
+                    from simulator import process_trace_with_belady
+                    cache = BeladyCache(int(config.cache_size * 1024 * 1024 * 1024))
+                    req_miss_ratio, _ = process_trace_with_belady(cache, reader)
                 elif alg.lower() == 'python_lru':
                     # Use our local Python LRU
                     cache = PythonLRUCache(int(config.cache_size * 1024 * 1024 * 1024))
                     req_miss_ratio, _ = cache.process_trace(reader)
                 else:
                     cache = setup_cache(config)
-                    req_miss_ratio, _ = cache.process_trace(reader)
+                    req_miss_ratio, _ = process_trace_with_lcs_cache(cache, reader)
+
                 req_hit_rate = 1.0 - req_miss_ratio
                 total_req_hit_rate += req_hit_rate
             avg_hit_rate = total_req_hit_rate / max(1, min(len(traces), max_traces) if max_traces else len(traces))
@@ -338,7 +379,9 @@ def parse_args():
     parser.add_argument('--config', type=str, required=True)
     parser.add_argument('--out', type=str, required=True)
     parser.add_argument('--algorithms', type=str, default='momentum_decay,lru,s3fifo,fifo,lfu,arc,sieve,lirs,twoq,slru,random')
-    parser.add_argument('--cache-sizes', type=str, default='0.1,0.5,1,2')
+    # Accept either a single quoted comma-separated list or multiple values like: --cache-sizes 0.1 0.5 1.0
+    parser.add_argument('--cache-sizes', nargs='+', default=['0.1,0.5,1,2'],
+                        help='Cache sizes in GB, either comma-separated or space-separated entries')
     parser.add_argument('--max-traces', type=int, default=0, help='Maximum number of traces to process (0 means all)')
     parser.add_argument('--experiment', type=str, choices=['alg_compare', 'pin_compare'], default='alg_compare')
     parser.add_argument('--pin-alg', type=str, default='momentum_decay', help='Algorithm to use in pinning comparison (only used with pin_compare)')
@@ -348,7 +391,16 @@ def parse_args():
 def main():
     args = parse_args()
     algorithms = [a.strip() for a in args.algorithms.split(',')]
-    cache_sizes = [float(s.strip()) for s in args.cache_sizes.split(',')]
+    # Normalize cache size argument(s): args.cache_sizes could be ['0.1,0.5'] or ['0.1','0.5']
+    cache_sizes = []
+    for token in args.cache_sizes:
+        # split on comma and whitespace
+        parts = [p for p in re.split(r'[,\s]+', token.strip()) if p]
+        for p in parts:
+            try:
+                cache_sizes.append(float(p))
+            except ValueError:
+                logger.warning(f"Ignoring invalid cache size: '{p}'")
     if args.experiment == 'alg_compare':
         run_algorithm_comparison(args.config, algorithms, cache_sizes, args.out, max_traces=args.max_traces)
     else:

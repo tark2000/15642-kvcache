@@ -1,4 +1,4 @@
-trace_dir: "traces/moba-512-3/beyond-4096"
+trace_dir: "moba-512-3/beyond-4096-organized"
 
 hidden_size: 1024
 num_layers: 28
@@ -9,11 +9,11 @@ context_length: 4096
 top_k: 3
 
 page_size: 32
-store_all_kvheads: true
+store_all_kvheads: false
 dtype_bytes: 2
 
 cache_size: 3
-eviction_algorithm: "momentum_decay"
+eviction_algorithm: "proactive_eviction"
 verbose: false
 
 batch_size: 1

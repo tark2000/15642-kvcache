@@ -44,6 +44,8 @@ class MomentumDecayCache:
         self.heap: list = []
         
         self.occupied_bytes = 0
+        # Optional set of pinned object IDs: these objects should not be evicted
+        self.pinned_objs = set()
         
         # Statistics
         self.hits = 0
@@ -61,6 +63,9 @@ class MomentumDecayCache:
             if obj_id in self.cache:
                 cached_score, obj_size, cached_version = self.cache[obj_id]
                 if version == cached_version:
+                    # Skip eviction if obj is pinned
+                    if obj_id in self.pinned_objs:
+                        continue
                     # Valid entry - evict it
                     del self.cache[obj_id]
                     self.occupied_bytes -= obj_size
@@ -71,6 +76,8 @@ class MomentumDecayCache:
     
     def _ensure_capacity(self, required_size: int):
         """Evict entries until we have enough space."""
+        # If there are only pinned objects that occupy the cache, we won't be able
+        # to free up space by evicting pinned objects, so we guard against infinite loop.
         while self.occupied_bytes + required_size > self.cache_size and self.cache:
             self._evict_one()
     
@@ -117,6 +124,26 @@ class MomentumDecayCache:
             self.occupied_bytes += obj_size
             
             return False
+
+    def pin(self, obj_id: int):
+        """Pin an object so it won't be evicted by the cache.
+
+        Returns True if the object was already in cache or was added as a placeholder.
+        """
+        self.pinned_objs.add(obj_id)
+        # If it's not in the cache, we can optionally add it with zero size placeholder
+        if obj_id not in self.cache:
+            # We can't know the obj_size here; caller should ensure it's added via access
+            # We'll create a placeholder entry with score = infinity to prevent eviction
+            self.cache[obj_id] = (float('inf'), 0, 0)
+            return True
+        return True
+
+    def unpin(self, obj_id: int):
+        if obj_id in self.pinned_objs:
+            self.pinned_objs.remove(obj_id)
+            return True
+        return False
     
     def get_miss_ratio(self) -> Tuple[float, float]:
         """

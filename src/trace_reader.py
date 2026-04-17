@@ -252,6 +252,82 @@ class MobaTraceReader(ReaderProtocol):
             yield from self._generate_paged_kvcache_requests_with_scores()
         else:
             yield from self._generate_bsa_kvcache_requests_with_scores()
+            
+    def generate_requests_with_proactive_scores(self, lookahead_boost: float = 0.5, shallow_boost: float = 0.3, shallow_cutoff: float = 0.25):
+        """
+        Generator that yields (obj_id, obj_size, score) tuples with proactive signals:
+        1. Momentum base score (same as before)
+        2. Lookahead boost: blocks selected by layer L+1 get score boost at layer L
+        3. Shallow-layer boost: blocks selected in early layers get boost throughout
+        """
+        num_iters = self.traces[0][0].shape[2]
+        num_layers = self.config.num_layers
+        shallow_cutoff_layer = int(num_layers * shallow_cutoff)
+
+        # Precompute shallow layer signals for each iter
+        # shallow_important[iter] = set of block (kvhead, block_id) tuples important in shallow layers
+        shallow_important = {}
+        for cur_iter in range(num_iters):
+            important = set()
+            for cur_layer in range(shallow_cutoff_layer):
+                block_ids = self.traces[cur_layer][0][:, :, cur_iter]
+                for kvhead_id in range(self.config.num_heads // self.config.kv_group_size):
+                    start_col = kvhead_id * self.config.kv_group_size
+                    end_col = (kvhead_id + 1) * self.config.kv_group_size
+                    cur_kvhead_block_ids = block_ids[:, start_col:end_col].flatten().tolist()
+                    cur_kvhead_block_ids.append(self._get_last_block_id())
+                    for bid in cur_kvhead_block_ids:
+                        important.add((kvhead_id, bid))
+            shallow_important[cur_iter] = important
+
+        for cur_iter in range(num_iters):
+            for cur_layer in range(num_layers):
+                block_ids = self.traces[cur_layer][0][:, :, cur_iter]
+                raw_scores = self.traces[cur_layer][1][:, :, cur_iter]
+                softmax_scores = self._softmax(raw_scores, axis=0)
+
+                # Lookahead: get next layer's selected blocks
+                next_selected = set()
+                if cur_layer + 1 < num_layers:
+                    next_block_ids = self.traces[cur_layer + 1][0][:, :, cur_iter]
+                    for kvhead_id in range(self.config.num_heads // self.config.kv_group_size):
+                        start_col = kvhead_id * self.config.kv_group_size
+                        end_col = (kvhead_id + 1) * self.config.kv_group_size
+                        nxt = next_block_ids[:, start_col:end_col].flatten().tolist()
+                        for bid in nxt:
+                            next_selected.add((kvhead_id, bid))
+
+                for kvhead_id in range(self.config.num_heads // self.config.kv_group_size):
+                    start_col = kvhead_id * self.config.kv_group_size
+                    end_col = (kvhead_id + 1) * self.config.kv_group_size
+                    cur_kvhead_block_ids = block_ids[:, start_col:end_col]
+                    cur_kvhead_scores = softmax_scores[:, start_col:end_col]
+
+                    block_score_map = {}
+                    for head_offset in range(cur_kvhead_block_ids.shape[1]):
+                        for top_idx in range(cur_kvhead_block_ids.shape[0]):
+                            bid = int(cur_kvhead_block_ids[top_idx, head_offset])
+                            score = float(cur_kvhead_scores[bid, head_offset])
+                            if bid not in block_score_map:
+                                block_score_map[bid] = score
+                            else:
+                                block_score_map[bid] = max(block_score_map[bid], score)
+
+                    last_block = self._get_last_block_id()
+                    block_score_map[last_block] = block_score_map.get(last_block, 1.0)
+
+                    for block_id, score in block_score_map.items():
+                        # Apply lookahead boost
+                        if (kvhead_id, block_id) in next_selected:
+                            score += lookahead_boost
+                        # Apply shallow layer boost
+                        if cur_layer >= shallow_cutoff_layer:
+                            if (kvhead_id, block_id) in shallow_important[cur_iter]:
+                                score += shallow_boost
+
+                        from kvcache import BsaKVCache
+                        block = BsaKVCache(self.seq_id, block_id, cur_layer, kvhead_id)
+                        yield (block.get_obj_id(), BsaKVCache.bytes(), score)
 
     def read_one_req(self) -> Request:
         if self._request_generator is None:
@@ -279,6 +355,7 @@ class MobaTraceReader(ReaderProtocol):
             "Why are you calling get_num_of_req()? I don't know that either"
         )
 
+
     def reset(self) -> None:
         self._request_generator = None
 
@@ -301,3 +378,5 @@ class MobaTraceReader(ReaderProtocol):
         raise NotImplementedError(
             "Why are you calling __len__()? I don't know that either"
         )
+    
+    
