@@ -12,8 +12,8 @@ page_size: 32
 store_all_kvheads: false
 dtype_bytes: 2
 
-cache_size: 3
-eviction_algorithm: "proactive_eviction"
+cache_size: 3.5
+eviction_algorithm: "sglang"
 verbose: false
 
 batch_size: 1
