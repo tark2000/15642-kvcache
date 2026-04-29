@@ -164,17 +164,11 @@ def process_trace_with_proactive(cache, reader: MobaTraceReader):
     return cache.get_miss_ratio()
 
 def process_trace_with_belady(cache, reader: MobaTraceReader):
-    """Process trace using Belady's optimal eviction algorithm."""
-    from belady_cache import BeladyCache
-    from kvcache import BsaKVCache
-    config = sim_config()
-
-    # Step 1: Generate full access sequence
     access_sequence = []
-    for obj_id, obj_size, score in reader.generate_requests_with_scores():
+    for obj_id, obj_size, _ in reader.generate_requests_with_scores():
         access_sequence.append((obj_id, obj_size))
 
-    # Step 2: Precompute next_access_time for each position
+    # precompute next access time for each position
     INF = len(access_sequence) + 1
     next_access = [INF] * len(access_sequence)
     last_seen = {}
@@ -184,10 +178,15 @@ def process_trace_with_belady(cache, reader: MobaTraceReader):
             next_access[i] = last_seen[obj_id]
         last_seen[obj_id] = i
 
-    # Step 3: Simulate
     for t, (obj_id, obj_size) in enumerate(access_sequence):
         cache.access(obj_id, obj_size, next_access[t])
 
+    return cache.get_miss_ratio()
+
+def process_trace_with_sglang(cache, reader: MobaTraceReader):
+    # flat leaf-lru: no parent hierarchy in bsa traces
+    for obj_id, obj_size, _ in reader.generate_requests_with_scores():
+        cache.access(obj_id, obj_size)
     return cache.get_miss_ratio()
 
 def get_num_traces(config: SimConfig) -> int:
@@ -218,8 +217,13 @@ def main():
         cache = setup_cache(config)
         
         if use_custom:
-            if config.eviction_algorithm.lower() == "proactive_eviction":
+            alg = config.eviction_algorithm.lower()
+            if alg == "proactive_eviction":
                 req_miss_ratio, bytes_miss_ratio = process_trace_with_proactive(cache, reader)
+            elif alg == "belady":
+                req_miss_ratio, bytes_miss_ratio = process_trace_with_belady(cache, reader)
+            elif alg == "sglang":
+                req_miss_ratio, bytes_miss_ratio = process_trace_with_sglang(cache, reader)
             else:
                 req_miss_ratio, bytes_miss_ratio = process_trace_with_momentum(cache, reader)
         else:
