@@ -12,7 +12,7 @@ from proactive_eviction import ProactiveEvictionCache
 logger = logging.getLogger(__name__)
 
 # Custom eviction algorithms (not from libcachesim)
-CUSTOM_ALGORITHMS = {"momentum_decay", "proactive_eviction", "belady"}
+CUSTOM_ALGORITHMS = {"momentum_decay", "proactive_eviction", "belady", "sglang"}
 
 # libcachesim-based eviction algorithms
 LCS_ALGORITHMS = {
@@ -65,6 +65,12 @@ def setup_cache(config: SimConfig) -> Union[lcs.CacheBase, MomentumDecayCache]:
         from belady_cache import BeladyCache
         cache = BeladyCache(cache_size=cache_size_bytes)
         logger.info(f"Using cache eviction algorithm: belady (optimal)")
+        return cache
+    
+    if algorithm == "sglang":
+        from sglang_cache import SGLangCache
+        cache = SGLangCache(cache_size=cache_size_bytes)
+        logger.info(f"Using cache eviction algorithm: sglang (radix LRU)")
         return cache
 
 
@@ -204,6 +210,9 @@ def main():
     
     for i in tqdm(range(num_traces), desc="Simulating traces"):
         trace_dir = os.path.join(config.trace_dir, f"trace{i:04d}")
+        if not os.path.exists(trace_dir):
+            logger.warning(f"Skipping missing trace dir: {trace_dir}")
+            continue
         print(f"Processing trace {trace_dir}")
         reader = MobaTraceReader(trace_dir=trace_dir, verbose=config.verbose)
         cache = setup_cache(config)
