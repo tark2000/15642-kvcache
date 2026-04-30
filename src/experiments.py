@@ -14,6 +14,9 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import json
+import csv
+from datetime import datetime
 from typing import List, Dict, Tuple
 from collections import OrderedDict
 
@@ -28,7 +31,16 @@ import re
 from glob import glob
 import shutil
 from pathlib import Path
-from simulator import setup_cache, process_trace_with_momentum, LCS_ALGORITHMS, CUSTOM_ALGORITHMS
+from simulator import (
+    setup_cache,
+    process_trace_with_momentum,
+    process_trace_with_proactive,
+    process_trace_with_belady,
+    process_trace_with_sglang,
+    process_trace_with_orca,
+    LCS_ALGORITHMS,
+    CUSTOM_ALGORITHMS,
+)
 from momentum_cache import MomentumDecayCache
 
 logger = logging.getLogger(__name__)
@@ -128,136 +140,120 @@ def process_trace_with_lcs_cache(cache, reader: MobaTraceReader):
     miss_ratio = 1.0 - (hits / total if total > 0 else 0.0)
     return miss_ratio, miss_ratio
 
+def run_single_experiment(alg: str, cache_size_bytes: int, trace_dir: str, config: SimConfig) -> float:
+    reader = MobaTraceReader(trace_dir=trace_dir, verbose=config.verbose)
+    alg_lower = alg.lower()
+    
+    if alg_lower == 'momentum_decay':
+        cache = setup_cache(config)
+        req_miss_ratio, _ = process_trace_with_momentum(cache, reader)
+    elif alg_lower == 'proactive_eviction':
+        cache = setup_cache(config)
+        req_miss_ratio, _ = process_trace_with_proactive(cache, reader)
+    elif alg_lower == 'belady':
+        from belady_cache import BeladyCache
+        cache = BeladyCache(cache_size_bytes)
+        req_miss_ratio, _ = process_trace_with_belady(cache, reader)
+    elif alg_lower == 'sglang':
+        from sglang_cache import SGLangCache
+        cache = SGLangCache(cache_size_bytes)
+        req_miss_ratio, _ = process_trace_with_sglang(cache, reader)
+    elif alg_lower == 'orca':
+        from orca_cache import ORCACache
+        cache = ORCACache(cache_size_bytes, window=3)
+        req_miss_ratio, _ = process_trace_with_orca(cache, reader)
+    elif alg_lower == 'python_lru':
+        cache = PythonLRUCache(cache_size_bytes)
+        req_miss_ratio, _ = cache.process_trace(reader)
+    else:
+        cache = setup_cache(config)
+        req_miss_ratio, _ = process_trace_with_lcs_cache(cache, reader)
+    
+    return req_miss_ratio
+
+
 def run_algorithm_comparison(config_path: str, algorithms: List[str], cache_sizes: List[float], out_path: str, max_traces: int = 0):
     config = sim_config()
     config.from_yaml(config_path)
 
-    # Prepare x axis
-    x_sizes = cache_sizes
-    results: Dict[str, List[float]] = {alg: [] for alg in algorithms}
-
-    # Validate algorithm list
     valid_algorithms = set(list(LCS_ALGORITHMS.keys()) + list(CUSTOM_ALGORITHMS) + ["python_lru"])
     for alg in algorithms:
         if alg.lower() not in valid_algorithms:
             raise ValueError(f"Unknown algorithm {alg}. Valid algorithms: {sorted(valid_algorithms)}")
 
-    for size in tqdm(x_sizes, desc="Cache sizes"):
-        # Run each algorithm with this cache size
+    trace_subdirs = sorted([d for d in glob(os.path.join(config.trace_dir, "trace*")) if os.path.isdir(d)])
+    if max_traces > 0:
+        trace_subdirs = trace_subdirs[:max_traces]
+    if not trace_subdirs:
+        raise ValueError(f"No trace directories found in {config.trace_dir}")
+    
+    print(f"Using {len(trace_subdirs)} traces")
+
+    # results: alg -> list of (size, avg_hit, std_hit, miss_ratios)
+    results: Dict[str, List[Tuple[float, float, float]]] = {alg: [] for alg in algorithms}
+    all_results = []  # for csv/json export
+
+    for size in tqdm(cache_sizes, desc="Cache sizes"):
+        config.cache_size = float(size)
+        cache_size_bytes = int(size * 1024 * 1024 * 1024)
+        
         for alg in algorithms:
-            config.cache_size = float(size)  # in GB
             config.eviction_algorithm = alg
-            # Average over traces
-            num_traces = len([f for f in os.listdir(config.trace_dir) if os.path.isdir(os.path.join(config.trace_dir, f)) == False])
-            # Discover trace directories: either traceNNNN subdirs or files in a single dir
-            trace_subdirs = sorted([d for d in glob(os.path.join(config.trace_dir, "trace*")) if os.path.isdir(d)])
-            if len(trace_subdirs) > 0:
-                traces = trace_subdirs
+            miss_ratios = []
+            
+            for trace_dir in trace_subdirs:
+                try:
+                    mr = run_single_experiment(alg, cache_size_bytes, trace_dir, config)
+                    miss_ratios.append(mr)
+                except Exception as e:
+                    print(f"warning: {alg} failed on {trace_dir}: {e}")
+            
+            if miss_ratios:
+                avg_miss = np.mean(miss_ratios)
+                std_miss = np.std(miss_ratios)
+                avg_hit = 1.0 - avg_miss
             else:
-                # Single directory contains trace files across IDs; treat as single "trace"
-                traces = [config.trace_dir]
-            total_req_hit_rate = 0.0
-            for tidx, trace_dir in enumerate(traces):
-                if max_traces and tidx >= max_traces:
-                    break
-                # If trace_dir is a flat folder with many traceNNNN files, create a per-seq folder
-                if trace_dir == config.trace_dir:
-                    # discover seq ids
-                    files = os.listdir(config.trace_dir)
-                    trace_ids = sorted(set([m.group(1) for f in files for m in [re.match(r"trace(\d+)_layer(\d+)_(blocks|scores)\.npy", f)] if m]))
-                    # We'll process first max_traces seq ids
-                    if len(trace_ids) == 0:
-                        raise ValueError(f"No trace files found in {config.trace_dir}")
-                    # If we are enumerating per-directory, we need to iterate seq ids separately
-                    # So set traces to the per-seq directories (virtual via copying)
-                    traces = []
-                    for sid in trace_ids:
-                        traces.append(os.path.join(config.trace_dir, f"trace{sid}"))
-                    # Re-run enumeration from the beginning using the new traces list
-                    for tidx2, trace_dir2 in enumerate(traces):
-                        if max_traces and tidx2 >= max_traces:
-                            break
-                        # assemble a temporary folder that contains files for this seq
-                        seqid = trace_dir2.split('trace')[-1]
-                        tmp_dir = os.path.join(config.trace_dir, f"tmp_trace{seqid}")
-                        os.makedirs(tmp_dir, exist_ok=True)
-                        for f in os.listdir(config.trace_dir):
-                            if f.startswith(f"trace{seqid}_"):
-                                shutil.copy(os.path.join(config.trace_dir, f), os.path.join(tmp_dir, f))
-                        trace_dir_use = tmp_dir
-                        # run with trace_dir_use
-                        reader = MobaTraceReader(trace_dir=trace_dir_use, verbose=config.verbose)
-                        # cleanup will be done at end of iteration
-                        cache_size_bytes = int(config.cache_size * 1024 * 1024 * 1024)
-                        if alg.lower() == 'momentum_decay':
-                            cache = setup_cache(config)
-                            req_miss_ratio, _ = process_trace_with_momentum(cache, reader)
-                        elif alg.lower() == 'proactive_eviction':
-                            from proactive_eviction import ProactiveEvictionCache
-                            from simulator import process_trace_with_proactive
-                            cache = setup_cache(config)
-                            req_miss_ratio, _ = process_trace_with_proactive(cache, reader)
-                        elif alg.lower() == 'belady':
-                            from belady_cache import BeladyCache
-                            from simulator import process_trace_with_belady
-                            cache = BeladyCache(int(config.cache_size * 1024 * 1024 * 1024))
-                            req_miss_ratio, _ = process_trace_with_belady(cache, reader)
-                        elif alg.lower() == 'python_lru':
-                            cache = PythonLRUCache(int(config.cache_size * 1024 * 1024 * 1024))
-                            req_miss_ratio, _ = cache.process_trace(reader)
-                        else:
-                            cache = setup_cache(config)
-                            req_miss_ratio, _ = process_trace_with_lcs_cache(cache, reader)
+                avg_miss, std_miss, avg_hit = 1.0, 0.0, 0.0
+            
+            results[alg].append((size, avg_hit, std_miss))
+            all_results.append({
+                "algorithm": alg,
+                "cache_size_gb": size,
+                "avg_miss_ratio": avg_miss,
+                "avg_hit_rate": avg_hit,
+                "std_miss_ratio": std_miss,
+                "num_traces": len(miss_ratios),
+            })
+            print(f"Alg={alg}, CacheSize={size}GB, AvgHitRate={avg_hit:.4f}, StdMiss={std_miss:.4f}")
 
-                        req_hit_rate = 1.0 - req_miss_ratio
-                        total_req_hit_rate += req_hit_rate
-                        # cleanup tmp
-                        shutil.rmtree(tmp_dir)
-                    # After this per-seq enumerations, we skip the rest of outer loop for this size/alg
-                    continue
-                # trace_dir is set from traces list
-                reader = MobaTraceReader(trace_dir=trace_dir, verbose=config.verbose)
-                cache_size_bytes = int(config.cache_size * 1024 * 1024 * 1024)
-                # Use setup_cache
-                if alg.lower() == 'momentum_decay':
-                    cache = setup_cache(config)
-                    req_miss_ratio, _ = process_trace_with_momentum(cache, reader)
-                elif alg.lower() == 'proactive_eviction':
-                    from proactive_eviction import ProactiveEvictionCache
-                    from simulator import process_trace_with_proactive
-                    cache = setup_cache(config)
-                    req_miss_ratio, _ = process_trace_with_proactive(cache, reader)
-                elif alg.lower() == 'belady':
-                    from belady_cache import BeladyCache
-                    from simulator import process_trace_with_belady
-                    cache = BeladyCache(int(config.cache_size * 1024 * 1024 * 1024))
-                    req_miss_ratio, _ = process_trace_with_belady(cache, reader)
-                elif alg.lower() == 'python_lru':
-                    # Use our local Python LRU
-                    cache = PythonLRUCache(int(config.cache_size * 1024 * 1024 * 1024))
-                    req_miss_ratio, _ = cache.process_trace(reader)
-                else:
-                    cache = setup_cache(config)
-                    req_miss_ratio, _ = process_trace_with_lcs_cache(cache, reader)
+    # save csv
+    base_path = out_path.rsplit('.', 1)[0]
+    csv_path = f"{base_path}.csv"
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["algorithm", "cache_size_gb", "avg_miss_ratio", "avg_hit_rate", "std_miss_ratio", "num_traces"])
+        writer.writeheader()
+        writer.writerows(all_results)
+    print(f"CSV saved to {csv_path}")
 
-                req_hit_rate = 1.0 - req_miss_ratio
-                total_req_hit_rate += req_hit_rate
-            avg_hit_rate = total_req_hit_rate / max(1, min(len(traces), max_traces) if max_traces else len(traces))
-            results[alg].append(avg_hit_rate)
-            print(f"Alg={alg}, CacheSize={size}GB, AvgHitRate={avg_hit_rate:.4f}")
+    # save json
+    json_path = f"{base_path}.json"
+    with open(json_path, "w") as f:
+        json.dump(all_results, f, indent=2)
+    print(f"JSON saved to {json_path}")
 
-    # Plot
+    # plot
     plt.figure(figsize=(10, 6))
-    for alg, y in results.items():
-        plt.plot(x_sizes, y, label=alg, marker='o')
+    for alg, data in results.items():
+        sizes = [d[0] for d in data]
+        hits = [d[1] for d in data]
+        plt.plot(sizes, hits, label=alg, marker='o')
     plt.xlabel('Cache size (GB)')
     plt.ylabel('Average Hit Rate')
     plt.grid(True)
     plt.legend()
     plt.tight_layout()
-    save_path = out_path
-    plt.savefig(save_path, dpi=300)
-    print(f"Algorithm comparison plot saved to {save_path}")
+    plt.savefig(out_path, dpi=300)
+    print(f"Plot saved to {out_path}")
 
 
 def run_pinning_comparison(config_path: str, alg: str, cache_sizes: List[float], out_path: str, max_traces: int = 0):

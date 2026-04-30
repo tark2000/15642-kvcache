@@ -195,6 +195,12 @@ def process_trace_with_sglang(cache, reader: MobaTraceReader):
         cache.access(obj_id, obj_size)
     return cache.get_miss_ratio()
 
+def process_trace_with_orca(cache, reader: MobaTraceReader):
+    # orca uses step-based hot/cold tiering, ignores score
+    for obj_id, obj_size, _ in reader.generate_requests_with_scores():
+        cache.access(obj_id, obj_size)
+    return cache.get_miss_ratio()
+
 def get_num_traces(config: SimConfig) -> int:
     return len(os.listdir(config.trace_dir))
 
@@ -230,6 +236,8 @@ def main():
                 req_miss_ratio, bytes_miss_ratio = process_trace_with_belady(cache, reader)
             elif alg == "sglang":
                 req_miss_ratio, bytes_miss_ratio = process_trace_with_sglang(cache, reader)
+            elif alg == "orca":
+                req_miss_ratio, bytes_miss_ratio = process_trace_with_orca(cache, reader)
             else:
                 req_miss_ratio, bytes_miss_ratio = process_trace_with_momentum(cache, reader)
         else:
