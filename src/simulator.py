@@ -12,7 +12,7 @@ from proactive_eviction import ProactiveEvictionCache
 logger = logging.getLogger(__name__)
 
 # Custom eviction algorithms (not from libcachesim)
-CUSTOM_ALGORITHMS = {"momentum_decay", "proactive_eviction", "belady", "sglang"}
+CUSTOM_ALGORITHMS = {"momentum_decay", "proactive_eviction", "belady", "sglang", "orca"}
 
 # libcachesim-based eviction algorithms
 LCS_ALGORITHMS = {
@@ -71,6 +71,12 @@ def setup_cache(config: SimConfig) -> Union[lcs.CacheBase, MomentumDecayCache]:
         from sglang_cache import SGLangCache
         cache = SGLangCache(cache_size=cache_size_bytes)
         logger.info(f"Using cache eviction algorithm: sglang (radix LRU)")
+        return cache
+    
+    if algorithm == "orca":
+        from orca_cache import ORCACache
+        cache = ORCACache(cache_size=cache_size_bytes, window=3)
+        logger.info(f"Using cache eviction algorithm: orca (window=3)")
         return cache
 
 
